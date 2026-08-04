@@ -3,13 +3,25 @@
 #
 # Subcommands:
 #   pair NAME              Add a new keyboard. Substring-match on advertised name.
-#                          Additive — does NOT forget existing pairings.
+#                          Additive — does NOT forget existing pairings. Only
+#                          not-yet-paired devices match the scan, so keyboards
+#                          that advertise a new address each pairing cycle
+#                          can't be shadowed by their own stale bond.
 #                          Put the keyboard in pairing mode FIRST.
+#                          Handles passkey-entry pairing: when the keyboard
+#                          requests a passkey, the script displays it and you
+#                          type the 6 digits on the keyboard then press Enter.
+#                          Numeric-comparison "yes/no" prompts are auto-confirmed.
 #                          Env: SCAN_SECS (default 12), PAIR_TIMEOUT (default 60),
 #                               AGENT_CAP (default DisplayOnly),
 #                               WAKE_ON_BT=yes (default no — keyboard does NOT
 #                                   wake the device from suspend).
-#   forget NAME            Remove the pairing for the keyboard whose name matches.
+#   scan [SECONDS]         Scan for nearby devices for SECONDS (default 15) and
+#                          print the named ones with their pair status. Use this
+#                          to find out what name a keyboard advertises before
+#                          calling 'pair'.
+#   forget NAME            Remove every pairing whose name matches (rotating-
+#                          address keyboards leave several same-name bonds).
 #   forget --all           Remove every pairing.
 #   list                   Show paired keyboards with connection status.
 #   enable                 Allow the watchdog to (re)connect; power adapter on.
@@ -66,12 +78,24 @@ cmd_pair() {
     BT_PID=$!
     exec 3>"$FIFO"
 
-    # Surface passkey prompts to the user in real time.
+    # Surface passkey prompts and auto-confirm yes/no dialogs. The subshell
+    # inherits fd 3 so it can write replies back to the same bluetoothctl session.
     (
         tail -F "$LOG" 2>/dev/null | while IFS= read -r line; do
-            case "$line" in
-                *Passkey:*|*"Enter passkey"*|*"Confirm passkey"*|*"PIN code"*)
-                    printf '\n>>> %s\n>>> Type the digits on the keyboard, then press Enter.\n\n' "$line"
+            # Strip ANSI color codes so pattern matching is reliable.
+            clean=$(printf '%s' "$line" | sed 's/\x1b\[[0-9;]*[mGKHF]//g')
+            case "$clean" in
+                *Passkey:*|*"[Passkey "*|*DisplayPasskey*|*"Enter passkey"*|*"PIN code"*|*"Enter PIN"*)
+                    pk=$(printf '%s' "$clean" | grep -oE '[0-9]{4,8}' | head -n 1)
+                    if [ -n "$pk" ]; then
+                        printf '\n>>> PASSKEY: %s\n>>> Type these digits on the keyboard, then press Enter.\n\n' "$pk"
+                    else
+                        printf '\n>>> %s\n>>> Type the digits on the keyboard, then press Enter.\n\n' "$clean"
+                    fi
+                    ;;
+                *"Confirm passkey"*|*"Authorize service"*|*"(yes/no)"*)
+                    # Auto-confirm numeric-comparison or service-authorize prompts.
+                    printf 'yes\n' >&3 2>/dev/null || true
                     ;;
             esac
         done
@@ -96,11 +120,16 @@ cmd_pair() {
     send "scan on"
 
     echo "[bt-keyboard pair] scanning for '$target' (max ${SCAN_SECS:-12}s) — keyboard must be in pairing mode"
+    # Match only devices that are not yet paired: some keyboards advertise a
+    # new random static address each time they enter pairing mode, so a stale
+    # bond with the same name must not shadow the freshly advertising one.
+    paired_set=" $(paired_macs | tr '\n' ' ') "
     mac=""
     i=0
     while [ "$i" -lt "${SCAN_SECS:-12}" ]; do
         mac=$(bluetoothctl devices 2>/dev/null \
-            | awk -v n="$target" 'index($0, n) > 0 { print $2; exit }')
+            | awk -v n="$target" -v p="$paired_set" '
+                index($0, n) > 0 && !index(p, " " $2 " ") { print $2; exit }')
         [ -n "$mac" ] && break
         sleep 1
         i=$((i+1))
@@ -109,6 +138,12 @@ cmd_pair() {
 
     if [ -z "$mac" ]; then
         echo "[bt-keyboard pair] did not find '$target' — is the keyboard in pairing mode?" >&2
+        stale=$(resolve_mac_by_name "$target")
+        if [ -n "$stale" ]; then
+            echo "[bt-keyboard pair] note: '$target' is already paired as $stale but is not advertising." >&2
+            echo "[bt-keyboard pair] if it no longer reconnects, the bond is stale — run:" >&2
+            echo "[bt-keyboard pair]     bt-keyboard.sh forget '$target'   then pair again." >&2
+        fi
         echo "[bt-keyboard pair] tip: tail $LOG for raw bluetoothctl output" >&2
         exit 1
     fi
@@ -143,6 +178,44 @@ cmd_pair() {
         | awk '/Name:|Paired:|Trusted:|Connected:|WakeAllowed:/ {print "    " $0}'
 }
 
+cmd_scan() {
+    secs="${1:-15}"
+    case "$secs" in
+        ''|*[!0-9]*) echo "Usage: bt-keyboard scan [SECONDS]" >&2; exit 2 ;;
+    esac
+
+    bring_up
+
+    echo "[bt-keyboard scan] scanning for ${secs}s — put your keyboard in pairing mode now"
+    bluetoothctl --timeout "$secs" scan on >/dev/null 2>&1 || true
+
+    paired_set=" $(paired_macs | tr '\n' ' ') "
+
+    found=0
+    echo
+    echo "Discovered devices (named):"
+    bluetoothctl devices 2>/dev/null | sort -k 3 | while read -r line; do
+        mac=$(printf '%s\n' "$line" | awk '{print $2}')
+        name=$(printf '%s\n' "$line" | sed 's/^Device [^ ]* //')
+        # Skip anonymous entries where the name is just the MAC with dashes.
+        case "$name" in
+            [0-9A-F][0-9A-F]-[0-9A-F][0-9A-F]-[0-9A-F][0-9A-F]-[0-9A-F][0-9A-F]-[0-9A-F][0-9A-F]-[0-9A-F][0-9A-F])
+                continue
+                ;;
+        esac
+        case "$paired_set" in
+            *" $mac "*) status=paired ;;
+            *) status="not paired" ;;
+        esac
+        printf '  %-30s  %s   %s\n' "$name" "$mac" "$status"
+        found=1
+    done
+
+    echo
+    echo "To pair: bt-keyboard.sh pair \"<name>\""
+    echo "(name match is a substring, so a unique prefix usually works)"
+}
+
 cmd_forget() {
     arg="${1:-}"
     [ -n "$arg" ] || { echo "Usage: bt-keyboard forget NAME | --all" >&2; exit 2; }
@@ -157,14 +230,17 @@ cmd_forget() {
         done
         echo "[bt-keyboard forget] removed $count pairing(s)"
     else
-        mac=$(resolve_mac_by_name "$arg")
-        if [ -z "$mac" ]; then
+        macs=$(bluetoothctl devices Paired 2>/dev/null \
+            | awk -v n="$arg" 'index($0, n) > 0 { print $2 }')
+        if [ -z "$macs" ]; then
             echo "[bt-keyboard forget] no paired device matches '$arg'. Currently paired:" >&2
             bluetoothctl devices Paired >&2 || true
             exit 1
         fi
-        bluetoothctl remove "$mac" >/dev/null 2>&1
-        echo "[bt-keyboard forget] removed $mac (matched '$arg')"
+        for mac in $macs; do
+            bluetoothctl remove "$mac" >/dev/null 2>&1 || true
+            echo "[bt-keyboard forget] removed $mac (matched '$arg')"
+        done
     fi
 }
 
@@ -179,7 +255,7 @@ cmd_list() {
         trusted=$(info_field "$info" Trusted)
         printf '  %s  %-25s  trusted=%s  connected=%s\n' "$mac" "${name:-?}" "${trusted:-?}" "${connected:-?}"
     done
-    [ "$has_any" = 0 ] && echo "(no paired devices)"
+    if [ "$has_any" = 0 ]; then echo "(no paired devices)"; fi
 }
 
 cmd_enable() {
@@ -234,6 +310,7 @@ shift || true
 
 case "$cmd" in
     pair)        cmd_pair "$@" ;;
+    scan)        cmd_scan "$@" ;;
     forget)      cmd_forget "$@" ;;
     list)        cmd_list "$@" ;;
     enable)      cmd_enable "$@" ;;

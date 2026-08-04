@@ -197,8 +197,9 @@ ssh root@10.11.99.1 '/home/root/bin/bt-keyboard.sh <subcommand> [args]'
 
 | Subcommand | What it does |
 | --- | --- |
-| `pair NAME` | Add a new keyboard. Substring match on the advertised name. **Additive** — does not touch other pairings. Put the keyboard in pairing mode first. |
-| `forget NAME` | Remove the pairing whose name matches `NAME`. |
+| `pair NAME` | Add a new keyboard. Substring match on the advertised name. **Additive** — does not touch other pairings. Put the keyboard in pairing mode first. Handles passkey-entry pairing automatically (script displays the 6-digit passkey, you type it on the keyboard then press Enter). |
+| `scan [SECONDS]` | Scan for nearby devices for `SECONDS` (default 15) and list the named ones with their pair status. Use this if you don't know what name your keyboard advertises. |
+| `forget NAME` | Remove every pairing whose name matches `NAME`. |
 | `forget --all` | Remove every pairing. |
 | `list` | Show all paired keyboards with trusted/connected state. |
 | `enable` | Allow the watchdog to reconnect; powers the adapter on. |
@@ -211,7 +212,7 @@ The `pair` subcommand:
 
 1. Loads the BT stack (calls `bt-keyboard-on.sh`).
 2. Drives `bluetoothctl` via a FIFO so the pairing agent stays registered.
-3. Scans for the named device, then pairs + trusts + connects.
+3. Scans for the named device and pairs + trusts + connects. Only not-yet-paired devices match the scan: some keyboards advertise a new random static address every time they enter pairing mode, and the fresh advertisement must not be shadowed by the stale bond with the same name.
 4. **Does not** set `WakeAllowed=true` by default — your keyboard will not wake the rM from suspend (saves battery; you wake the rM with the power button, the keyboard reconnects within seconds).
 
 Env-var overrides:
@@ -266,6 +267,31 @@ Paired devices:
 ### Pair fails with `AuthenticationCanceled`
 
 The keyboard fell out of pairing mode before the SMP exchange completed. Long-press the pair button again and re-run `bt-keyboard.sh pair` immediately.
+
+### The keyboard stopped reconnecting and `list` shows several same-name entries
+
+Keyboards that advertise a new random static address each time they enter pairing mode leave a dead bond behind on every re-pair. Clean up **before** re-pairing (`forget` removes every name match, including any fresh bond):
+
+```sh
+ssh root@10.11.99.1 '/home/root/bin/bt-keyboard.sh forget "WirelessKeyboard"'
+# put the keyboard in pairing mode, then:
+ssh root@10.11.99.1 '/home/root/bin/bt-keyboard.sh pair "WirelessKeyboard"'
+```
+
+### No adapter — `status` shows `Powered=` and `bluetoothctl list` prints nothing
+
+The BT chip can wedge during firmware load. Confirm with `dmesg | grep hci0` — a `FW Download Timeout` line and `hciconfig hci0` showing `BD Address: 00:00:00:00:00:00` mean the controller never initialized. Reload it:
+
+```sh
+ssh root@10.11.99.1 '
+  systemctl stop bluetooth
+  modprobe -r btnxpuart
+  modprobe btnxpuart
+  systemctl start bluetooth
+'
+```
+
+The firmware re-download takes ~10 s; `bluetoothctl list` then shows the controller and the watchdog reconnects your keyboard.
 
 ### Inspect raw HCI exchange
 
